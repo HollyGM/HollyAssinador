@@ -1,0 +1,25 @@
+# Python
+__pycache__/
+*.py[cod]
+.venv/
+.venv*/
+venv/
+
+# Build do app (gerado por build_macos.sh)
+build/
+dist/
+*.spec
+assets/*.iconset/
+
+# macOS
+.DS_Store
+
+# Nunca versionar certificados ou chaves
+*.p12
+*.pfx
+*.pem
+*.key
+*.p8
+*.cer
+*.crt
+*.der
