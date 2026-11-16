@@ -55,7 +55,7 @@ def _pkcs12_bytes(password: bytes):
         .public_key(key.public_key())
         .serial_number(x509.random_serial_number())
         .not_valid_before(now - datetime.timedelta(minutes=1))
-        .not_valid_after(now + datetime.timedelta(days=1))
+        .not_valid_after(now + datetime.timedelta(days=365))
         .sign(key, hashes.SHA256())
     )
     data = pkcs12.serialize_key_and_certificates(

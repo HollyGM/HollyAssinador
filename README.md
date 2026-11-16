@@ -18,7 +18,10 @@
 
 - Assinatura criptográfica **PAdES** (SHA-256) gravada dentro do PDF, de forma incremental: o documento original não é reescrito e assinaturas anteriores continuam válidas.
 - Certificado **A1** (`.p12` / `.pfx`) ou **A3** via **PKCS#11** (token ou cartão).
-- **Aparência da assinatura:** invisível (padrão) ou um carimbo pequeno no rodapé da última página, **sempre em área livre**, sem cobrir o texto.
+- **Aparência da assinatura:** invisível (padrão) ou um carimbo pequeno no rodapé da última página, **sempre em área livre**, sem cobrir o texto. O carimbo mostra o nome do titular **sem o CPF/CNPJ** que o padrão ICP-Brasil põe no nome do certificado.
+- **Vários PDFs de uma vez:** selecione todos no "Abrir…"; com A3, o PIN é digitado uma vez para o lote inteiro.
+- **Mostrar no Finder** ao terminar, com o PDF assinado já selecionado.
+- **Confere a validade do certificado:** recusa certificado vencido (a assinatura seria rejeitada) e avisa quando faltam menos de 30 dias para vencer.
 - Motivo, local e carimbo do tempo (RFC 3161) opcional por URL de TSA.
 - Lembra as configurações (caminhos e labels do token), **nunca a senha nem o PIN**.
 
@@ -26,13 +29,15 @@
 
 - Tudo roda no seu Mac. O app **só usa a rede se você informar uma TSA**; o autoteste completo de assinatura foi executado com toda a rede bloqueada pelo sistema.
 - A chave do A3 nunca sai do token; a do A1 só é carregada durante a assinatura.
-- Senha do A1 e PIN do A3 não são gravados nem registrados em log.
+- Senha do A1 e PIN do A3 não são gravados nem registrados em log, e o campo é **apagado a cada assinatura**: quem chegar ao Mac com o app aberto não assina sem digitar de novo.
+- O PDF assinado é gravado primeiro num arquivo temporário e só no fim substitui o destino. Se a assinatura falhar no meio (TSA fora do ar, token desconectado), um arquivo que já existisse com o mesmo nome continua intacto. Antes de substituir um arquivo existente, o app pergunta.
+- PIN errado, PIN bloqueado e token ausente têm mensagens diferentes, para você não insistir num PIN errado até bloquear o token.
 - O `.gitignore` do projeto impede que certificados e chaves (`.p12`, `.pfx`, `.pem`, `.key`...) sejam versionados por engano. Veja também o [SECURITY.md](SECURITY.md).
 
 ## O que o app **não** faz
 
 - Não valida a cadeia de certificação ICP-Brasil nem gera assinaturas com política ICP-Brasil (AD-RB/AD-RT) ou LTV. A assinatura é PAdES básica, com carimbo do tempo se uma TSA for informada.
-- Não assina em lote nem integra com navegador. Uma integração web precisaria de autenticação forte, controle de `Origin` e confirmação do usuário a cada documento; não exponha uma porta local que assine sem isso.
+- Não integra com navegador. Uma integração web precisaria de autenticação forte, controle de `Origin` e confirmação do usuário a cada documento; não exponha uma porta local que assine sem isso.
 - O carimbo visível só vai na última página e é desativado (a assinatura sai invisível, com aviso) se não houver área livre ou se a página estiver girada.
 - Só macOS. Desenvolvido em Apple Silicon.
 - Projeto independente: sem vínculo com tribunais, ITI/ICP-Brasil, Adobe ou fabricantes de token. Não é assessoria jurídica; confira se o seu destino aceita o tipo de assinatura.
@@ -61,9 +66,13 @@ O app fica em `dist/HollyAssinador.app`; arraste-o para `/Applications`. Para te
 2. Selecione `A1`, o arquivo `.p12`/`.pfx` e digite a senha.
 3. Clique em **Assinar PDF**.
 
+### Vários PDFs de uma vez
+
+No **Abrir…**, selecione vários PDFs (⌘-clique ou ⇧-clique). Cada um é salvo como `nome-assinado.pdf` na pasta do original; para juntar todos numa pasta só, use o botão **Pasta…**. Um PDF com problema não interrompe os outros: no fim, o app mostra quantos foram assinados e por que algum ficou de fora. O app recusa o lote se dois PDFs fossem gerar o mesmo nome de saída.
+
 ### Certificado A3 (token/cartão)
 
-Informe o módulo PKCS#11 do fabricante (`.dylib`), o *token label* e o *certificate label*. O *key label* pode ficar vazio: a chave privada é localizada pelo ID do certificado (convenção do PKCS#11). O PIN é digitado a cada assinatura.
+Informe o módulo PKCS#11 do fabricante (`.dylib`), o *token label* e o *certificate label*. O *key label* pode ficar vazio: a chave privada é localizada pelo ID do certificado (convenção do PKCS#11). O PIN é digitado a cada assinatura (ou a cada lote) e apagado do campo em seguida.
 
 Locais comuns do módulo: `/Library/Frameworks/`, `/Library/Application Support/`, `/usr/local/lib/`, `/opt/homebrew/lib/`. Tokens SafeNet eToken com o SafeNet Authentication Client usam `/usr/local/lib/libeTPkcs11.dylib`.
 
@@ -97,15 +106,16 @@ Ficam em `~/Library/Application Support/HollyAssinador/config.json` (permissão 
 
 Contribuições são bem-vindas: issues, correções, testes e documentação. Boas frentes:
 
-- testes automatizados e CI;
 - validação da assinatura dentro do app e perfis de assinatura (PAdES-LT/LTA, políticas ICP-Brasil);
 - teste com outros tokens/cartões e relatos de módulos PKCS#11 que funcionam;
 - assinatura e notarização do `.app`; empacotamento (`.dmg`);
-- posição do carimbo configurável e assinatura em lote.
+- posição do carimbo configurável.
 
-**Estrutura:** `app.py` (interface Tkinter) · `signer_core.py` (assinatura com pyHanko) · `placement.py` (área livre para o carimbo, via pypdfium2) · `settings.py` (configurações) · `selftest.py` · `assets/` (logo; `make_icon.swift` regenera o ícone com `swift assets/make_icon.swift assets`).
+**Estrutura:** `app.py` (interface Tkinter) · `signer_core.py` (assinatura com pyHanko) · `placement.py` (área livre para o carimbo, via pypdfium2) · `settings.py` (configurações) · `selftest.py` · `tests/` · `assets/` (logo; `make_icon.swift` regenera o ícone com `swift assets/make_icon.swift assets`).
 
 **Autoteste:** `HollyAssinador.app/Contents/MacOS/HollyAssinador --self-test` assina um PDF temporário com um certificado temporário e confere pyHanko, pdfium e PKCS#11 empacotados. O `build_macos.sh` roda esse teste no final e falha se algo estiver quebrado.
+
+**Testes:** `.venv/bin/python -m unittest discover -s tests -t .` roda os testes do núcleo (gravação segura, validade do certificado, carimbo sem CPF, mensagens de erro, lote) e da janela, sempre com certificados e PDFs fictícios em pastas temporárias. O GitHub roda os mesmos testes e o autoteste a cada envio (`.github/workflows/testes.yml`).
 
 ## Licença
 

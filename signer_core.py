@@ -1,9 +1,14 @@
 from __future__ import annotations
 
+import os
+import re
+import tempfile
+from collections.abc import Callable, Iterable, Iterator
+from contextlib import contextmanager
 from dataclasses import dataclass
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Optional
-from datetime import datetime
 
 from pyhanko import stamp
 from pyhanko.pdf_utils.incremental_writer import IncrementalPdfFileWriter
@@ -30,6 +35,16 @@ class SigningResult:
     notes: tuple[str, ...] = ()
 
 
+@dataclass(frozen=True)
+class BatchOutcome:
+    """Resultado de um PDF dentro de uma assinatura em lote."""
+
+    src: Path
+    dst: Path
+    result: Optional[SigningResult] = None
+    error: Optional[str] = None
+
+
 HYBRID_NOTE = (
     "Este PDF usa referências cruzadas híbridas (estrutura incomum de alguns "
     "geradores de PDF). A assinatura foi feita em modo tolerante; alguns "
@@ -45,6 +60,13 @@ NO_SPACE_NOTE = (
 
 STAMP_WIDTH = 300
 STAMP_HEIGHT = 36
+
+# Avisa quando faltar menos que isto para o certificado vencer.
+EXPIRY_WARNING_DAYS = 30
+
+# No padrão ICP-Brasil o nome comum do certificado é "NOME:CPF" (e-CPF) ou
+# "RAZÃO SOCIAL:CNPJ" (e-CNPJ). O número não deve ir para o carimbo visível.
+_ICP_DOCUMENT_SUFFIX = re.compile(r"\s*:\s*\d{11}(?:\d{3})?\s*$")
 
 
 def _open_writer(inf) -> tuple[IncrementalPdfFileWriter, bool]:
@@ -111,12 +133,121 @@ def _field_spec(field_name: str, box):
     return fields.SigFieldSpec(sig_field_name=field_name, on_page=-1, box=box)
 
 
-def _sign_with_signer(
+def _date(moment: datetime) -> str:
+    return moment.astimezone().strftime("%d/%m/%Y")
+
+
+def certificate_notes(cert, now: Optional[datetime] = None) -> tuple[str, ...]:
+    """Recusa certificado vencido (ou ainda não válido) e avisa quando está perto de vencer."""
+    if cert is None:
+        return ()
+    now = now or datetime.now(timezone.utc)
+    start, end = cert.not_valid_before, cert.not_valid_after
+    if now > end:
+        raise SigningError(
+            f"O certificado venceu em {_date(end)}. Uma assinatura feita com ele "
+            "seria recusada pelos validadores. Renove o certificado antes de assinar."
+        )
+    if now < start:
+        raise SigningError(
+            f"O certificado só passa a valer em {_date(start)}. "
+            "Confira a data e a hora do Mac."
+        )
+    # Dias de calendário no fuso do Mac, para "hoje" e "amanhã" baterem com a data mostrada.
+    days = (end.astimezone().date() - now.astimezone().date()).days
+    if days >= EXPIRY_WARNING_DAYS:
+        return ()
+    if days == 0:
+        when = f"vence hoje ({_date(end)})"
+    elif days == 1:
+        when = f"vence amanhã ({_date(end)})"
+    else:
+        when = f"vence em {_date(end)}, daqui a {days} dias"
+    return (f"O certificado {when}. Providencie a renovação.",)
+
+
+def display_name(cert) -> Optional[str]:
+    """Nome para o carimbo visível, sem o CPF/CNPJ que o padrão ICP-Brasil põe no nome."""
+    if cert is None:
+        return None
+    subject = cert.subject.native
+    name = subject.get("common_name") or subject.get("organization_name")
+    if isinstance(name, (list, tuple)):
+        name = name[0] if name else None
+    if not name:
+        return None
+    return _ICP_DOCUMENT_SUFFIX.sub("", str(name)).strip() or None
+
+
+def friendly_error(exc: BaseException) -> str:
+    """Traduz os erros mais comuns das bibliotecas para uma mensagem em português."""
+    import pkcs11.exceptions as p11
+    from pyhanko.pdf_utils.crypt.api import PdfKeyNotAvailableError
+    from pyhanko.pdf_utils.misc import PdfReadError
+    from pyhanko.sign.timestamps.common_utils import TimestampRequestError
+
+    if isinstance(exc, TimestampRequestError):
+        return (
+            "Não foi possível obter o carimbo do tempo na TSA informada (endereço "
+            "fora do ar, errado ou sem internet). Nada foi gravado. Confira a URL da "
+            "TSA ou deixe o campo vazio para assinar sem ela."
+        )
+    if isinstance(exc, PdfKeyNotAvailableError):
+        return (
+            "Este PDF está protegido por senha. Remova a proteção (ou gere o PDF de "
+            "novo, sem senha) antes de assinar."
+        )
+    if isinstance(exc, PdfReadError):
+        return (
+            "Não foi possível ler o PDF. O arquivo pode estar corrompido ou não ser "
+            "um PDF de verdade."
+        )
+    if isinstance(exc, (p11.DeviceRemoved, p11.TokenNotPresent)):
+        return (
+            "O token foi desconectado durante a assinatura. Nada foi gravado; "
+            "conecte-o e tente de novo."
+        )
+    if isinstance(exc, PermissionError):
+        return (
+            "Sem permissão para ler ou gravar o arquivo. Confira se a pasta permite "
+            "gravação e se o macOS deu ao HollyAssinador acesso a ela."
+        )
+    return f"Falha na assinatura: {exc}"
+
+
+def same_file(a: Path, b: Path) -> bool:
+    """True se os dois caminhos levam ao mesmo arquivo.
+
+    O disco do Mac normalmente não diferencia maiúsculas de minúsculas, então
+    "Contrato.pdf" e "contrato.pdf" são o mesmo arquivo, embora os nomes difiram.
+    """
+    if a == b:
+        return True
+    try:
+        return b.exists() and os.path.samefile(a, b)
+    except OSError:
+        return False
+
+
+def _discard(path: Path) -> None:
+    try:
+        path.unlink()
+    except OSError:
+        pass
+
+
+def sign_file(
+    signer,
     input_pdf: str | Path,
     output_pdf: str | Path,
-    signer,
     opts: SignatureOptions,
 ) -> SigningResult:
+    """Assina um PDF com um signer já aberto (A1 ou A3).
+
+    O PDF assinado é gravado primeiro num arquivo temporário na pasta de destino
+    e só no fim substitui o destino. Se algo falhar no meio, um arquivo que já
+    existisse com o nome de saída fica intacto.
+    """
     src = Path(input_pdf).expanduser().resolve()
     dst = Path(output_pdf).expanduser().resolve()
 
@@ -124,22 +255,36 @@ def _sign_with_signer(
         raise SigningError(f"PDF de entrada não encontrado: {src}")
     if src.suffix.lower() != ".pdf":
         raise SigningError("O arquivo de entrada deve ser PDF.")
-    if src == dst:
+    if same_file(src, dst):
         raise SigningError("Escolha um arquivo de saída diferente do PDF original.")
 
-    dst.parent.mkdir(parents=True, exist_ok=True)
+    notes: tuple[str, ...] = certificate_notes(signer.signing_cert)
 
     field_name = _field_name()
     meta = _metadata(field_name, opts)
     tsa = _timestamper(opts)
-    notes: tuple[str, ...] = ()
 
     box = _footer_box(src) if opts.appearance == "footer" else None
     if opts.appearance == "footer" and box is None:
         notes += (NO_SPACE_NOTE,)
+    text_params = {}
+    name = display_name(signer.signing_cert)
+    if name:
+        text_params["signer"] = name
 
     try:
-        with src.open("rb") as inf:
+        dst.parent.mkdir(parents=True, exist_ok=True)
+        fd, tmp_name = tempfile.mkstemp(
+            prefix=".HollyAssinador-", suffix=".pdf", dir=dst.parent
+        )
+    except OSError as exc:
+        raise SigningError(
+            f"Não foi possível gravar na pasta {dst.parent}: {exc.strerror or exc}"
+        ) from exc
+    tmp = Path(tmp_name)
+
+    try:
+        with os.fdopen(fd, "wb") as outf, src.open("rb") as inf:
             writer, hybrid = _open_writer(inf)
             if hybrid:
                 notes += (HYBRID_NOTE,)
@@ -150,29 +295,83 @@ def _sign_with_signer(
                 stamp_style=_stamp_style() if box else None,
                 new_field_spec=_field_spec(field_name, box),
             )
-            with dst.open("wb") as outf:
-                pdf_signer.sign_pdf(writer, output=outf)
+            pdf_signer.sign_pdf(
+                writer, output=outf, appearance_text_params=text_params or None
+            )
+        if tmp.stat().st_size == 0:
+            raise SigningError("A biblioteca não produziu um PDF assinado.")
+        os.chmod(tmp, 0o644)
+        os.replace(tmp, dst)
+    except SigningError:
+        _discard(tmp)
+        raise
     except Exception as exc:
-        try:
-            if dst.exists() and dst.stat().st_size == 0:
-                dst.unlink()
-        except OSError:
-            pass
-        raise SigningError(str(exc)) from exc
-
-    if not dst.exists() or dst.stat().st_size == 0:
-        raise SigningError("A biblioteca não produziu um PDF assinado.")
+        _discard(tmp)
+        raise SigningError(friendly_error(exc)) from exc
 
     return SigningResult(dst, notes)
 
 
-def sign_pdf_a1(
-    input_pdf: str | Path,
-    output_pdf: str | Path,
-    pkcs12_file: str | Path,
-    password: str,
+def output_for(src: str | Path, folder: str | Path | None = None) -> Path:
+    """Nome padrão do PDF assinado: "<nome>-assinado.pdf", na pasta indicada ou na do original."""
+    src = Path(src).expanduser().resolve()
+    base = Path(folder).expanduser().resolve() if folder else src.parent
+    return base / f"{src.stem}-assinado.pdf"
+
+
+def plan_batch(
+    inputs: Iterable[str | Path], folder: str | Path | None = None
+) -> list[tuple[Path, Path]]:
+    """Pares (original, assinado) de um lote, recusando nomes de saída que colidem."""
+    sources = [Path(p).expanduser().resolve() for p in inputs]
+    source_keys = {str(p).casefold() for p in sources}
+    seen: set[str] = set()
+    pairs = []
+    for src in sources:
+        dst = output_for(src, folder)
+        key = str(dst).casefold()
+        if key in seen:
+            raise SigningError(
+                f"Dois PDFs gerariam o mesmo arquivo assinado ({dst.name}). "
+                "Assine-os separadamente ou escolha outra pasta de saída."
+            )
+        if key in source_keys:
+            raise SigningError(
+                f"O arquivo assinado de {src.name} substituiria outro PDF da lista "
+                f"({dst.name}). Tire um dos dois da seleção."
+            )
+        seen.add(key)
+        pairs.append((src, dst))
+    return pairs
+
+
+def sign_batch(
+    signer,
+    pairs: Iterable[tuple[str | Path, str | Path]],
     opts: SignatureOptions,
-) -> SigningResult:
+    progress: Optional[Callable[[int, int, Path], None]] = None,
+) -> list[BatchOutcome]:
+    """Assina vários PDFs com o mesmo signer (o PIN do A3 é pedido uma vez só).
+
+    Um PDF com problema não interrompe os demais; o erro fica no resultado dele.
+    Certificado vencido interrompe antes do primeiro arquivo.
+    """
+    pairs = [(Path(s), Path(d)) for s, d in pairs]
+    certificate_notes(signer.signing_cert)
+    outcomes = []
+    for index, (src, dst) in enumerate(pairs, 1):
+        if progress:
+            progress(index, len(pairs), src)
+        try:
+            result = sign_file(signer, src, dst, opts)
+            outcomes.append(BatchOutcome(src, dst, result=result))
+        except SigningError as exc:
+            outcomes.append(BatchOutcome(src, dst, error=str(exc)))
+    return outcomes
+
+
+def load_a1(pkcs12_file: str | Path, password: str):
+    """Abre o certificado A1 (.p12/.pfx) e devolve o signer."""
     cert = Path(pkcs12_file).expanduser().resolve()
     if not cert.exists():
         raise SigningError(f"Certificado A1 não encontrado: {cert}")
@@ -193,8 +392,17 @@ def sign_pdf_a1(
         raise SigningError(
             "Não foi possível abrir o certificado A1. Confira o arquivo e a senha."
         )
+    return signer
 
-    return _sign_with_signer(input_pdf, output_pdf, signer, opts)
+
+def sign_pdf_a1(
+    input_pdf: str | Path,
+    output_pdf: str | Path,
+    pkcs12_file: str | Path,
+    password: str,
+    opts: SignatureOptions,
+) -> SigningResult:
+    return sign_file(load_a1(pkcs12_file, password), input_pdf, output_pdf, opts)
 
 
 def _cert_id(session, cert_label: str) -> Optional[bytes]:
@@ -216,18 +424,48 @@ def _cert_id(session, cert_label: str) -> Optional[bytes]:
         return None
 
 
-def sign_pdf_a3(
-    input_pdf: str | Path,
-    output_pdf: str | Path,
+def token_open_error(exc: BaseException) -> str:
+    """Mensagem para falha ao abrir o token, distinguindo PIN errado, bloqueado e token ausente."""
+    import pkcs11.exceptions as p11
+
+    if isinstance(exc, p11.PinIncorrect):
+        return (
+            "PIN incorreto. Atenção: o token bloqueia depois de algumas tentativas "
+            "erradas. Confira o PIN com calma antes de tentar de novo."
+        )
+    if isinstance(exc, p11.PinLocked):
+        return (
+            "O PIN do token está bloqueado por excesso de tentativas erradas. "
+            "Desbloqueie-o no programa do fabricante do token (por exemplo, o SafeNet "
+            "Authentication Client), que pede a senha de administrador."
+        )
+    if isinstance(exc, p11.PinExpired):
+        return "O PIN do token expirou. Troque-o no programa do fabricante do token."
+    if isinstance(exc, (p11.PinLenRange, p11.PinInvalid)):
+        return "O PIN digitado não tem o formato aceito pelo token. Confira e digite de novo."
+    if isinstance(
+        exc,
+        (p11.TokenNotPresent, p11.NoSuchToken, p11.DeviceRemoved, p11.TokenNotRecognised),
+    ) or "no token" in str(exc).lower():
+        return (
+            "Nenhum token encontrado. Confira se o token está conectado e se o "
+            "campo \"Token label\" está correto."
+        )
+    return (
+        "Não foi possível abrir o token A3. Confira o módulo PKCS#11 (driver do "
+        "fabricante), o token selecionado e o PIN."
+    )
+
+
+@contextmanager
+def open_a3(
     module_path: str | Path,
     token_label: str,
     cert_label: str,
     key_label: str,
     pin: str,
-    opts: SignatureOptions,
-) -> SigningResult:
-    """
-    Assina usando um token/cartão A3 através do módulo PKCS#11 do fabricante.
+) -> Iterator:
+    """Abre o token/cartão A3 uma vez e entrega o signer; fecha a sessão no fim.
 
     No macOS, o fabricante normalmente instala um arquivo .dylib contendo a
     implementação PKCS#11. O módulo, o rótulo do token e o rótulo do certificado
@@ -242,7 +480,7 @@ def sign_pdf_a3(
 
     try:
         from pyhanko.config.pkcs11 import TokenCriteria
-        from pyhanko.sign.pkcs11 import open_pkcs11_session, PKCS11Signer
+        from pyhanko.sign.pkcs11 import PKCS11Signer, open_pkcs11_session
 
         criteria = (
             TokenCriteria(label=token_label.strip())
@@ -256,32 +494,49 @@ def sign_pdf_a3(
             user_pin=pin if pin else None,
         )
     except Exception as exc:
-        raise SigningError(
-            "Não foi possível abrir o token A3. Confira o driver/módulo PKCS#11, "
-            "o token selecionado e o PIN."
-        ) from exc
+        raise SigningError(token_open_error(exc)) from exc
 
     try:
-        # Sem key label, o pyHanko procuraria a chave com o label do certificado,
-        # que em vários tokens é diferente. Pelo ID não depende disso.
-        cert_id = None if key_label.strip() else _cert_id(session, cert_label.strip())
-        signer = PKCS11Signer(
-            pkcs11_session=session,
-            cert_label=cert_label.strip(),
-            key_label=key_label.strip() or None,
-            cert_id=cert_id,
-            key_id=cert_id,
-        )
-        return _sign_with_signer(input_pdf, output_pdf, signer, opts)
-    except SigningError:
-        raise
-    except Exception as exc:
-        raise SigningError(
-            "Falha ao assinar com o A3. Confira os labels do certificado/chave "
-            "e a compatibilidade do módulo PKCS#11."
-        ) from exc
+        try:
+            # Sem key label, o pyHanko procuraria a chave com o label do certificado,
+            # que em vários tokens é diferente. Pelo ID não depende disso.
+            cert_id = None if key_label.strip() else _cert_id(session, cert_label.strip())
+            signer = PKCS11Signer(
+                pkcs11_session=session,
+                cert_label=cert_label.strip(),
+                key_label=key_label.strip() or None,
+                cert_id=cert_id,
+                key_id=cert_id,
+            )
+            signer.signing_cert  # carrega certificado e chave agora, para errar cedo
+        except Exception as exc:
+            if not pin:
+                raise SigningError(
+                    "Digite o PIN do token: sem ele o token não libera o certificado "
+                    "e a chave."
+                ) from exc
+            raise SigningError(
+                "Não foi possível localizar o certificado e a chave no token. Confira o "
+                "\"Certificate label\" e, se preenchido, o \"Key label\"."
+            ) from exc
+        yield signer
     finally:
         try:
             session.close()
         except Exception:
             pass
+
+
+def sign_pdf_a3(
+    input_pdf: str | Path,
+    output_pdf: str | Path,
+    module_path: str | Path,
+    token_label: str,
+    cert_label: str,
+    key_label: str,
+    pin: str,
+    opts: SignatureOptions,
+) -> SigningResult:
+    """Assina usando um token/cartão A3 através do módulo PKCS#11 do fabricante."""
+    with open_a3(module_path, token_label, cert_label, key_label, pin) as signer:
+        return sign_file(signer, input_pdf, output_pdf, opts)

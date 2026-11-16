@@ -11,11 +11,15 @@ from tkinter import filedialog, messagebox, ttk
 try:
     import settings
     from signer_core import (
+        BatchOutcome,
         SignatureOptions,
         SigningError,
-        SigningResult,
-        sign_pdf_a1,
-        sign_pdf_a3,
+        load_a1,
+        open_a3,
+        output_for,
+        plan_batch,
+        same_file,
+        sign_batch,
     )
 except ImportError as exc:
     raise SystemExit(
@@ -30,6 +34,8 @@ APPEARANCES = {
     "invisible": "Invisível: sem carimbo no PDF (padrão)",
     "footer": "Carimbo no rodapé da última página, em área livre",
 }
+
+BATCH_OUTPUT_HINT = 'Na pasta de cada PDF, com "-assinado" no nome'
 
 
 class AssinadorApp(tk.Tk):
@@ -56,6 +62,14 @@ class AssinadorApp(tk.Tk):
         self.appearance = tk.StringVar(value="invisible")
         self.appearance_label = tk.StringVar(value=APPEARANCES["invisible"])
         self.status = tk.StringVar(value="Pronto.")
+
+        # Lote: vários PDFs escolhidos de uma vez (vazio = um PDF só, pelos campos).
+        self.batch_files: list[str] = []
+        self.batch_folder = ""
+        # Saída escolhida em "Salvar como…": o próprio diálogo já confirmou a substituição.
+        self._confirmed_out = ""
+        # PDFs assinados na última vez, para o botão "Mostrar no Finder".
+        self.last_outputs: list[Path] = []
 
         # Campos lembrados entre execuções (nunca a senha do A1 nem o PIN do A3).
         self._remembered = {
@@ -126,20 +140,19 @@ class AssinadorApp(tk.Tk):
         files_box.columnconfigure(1, weight=1)
 
         ttk.Label(files_box, text="PDF de entrada").grid(row=0, column=0, sticky="w", **pad)
-        ttk.Entry(files_box, textvariable=self.pdf_in).grid(
-            row=0, column=1, sticky="ew", **pad
-        )
+        self.in_entry = ttk.Entry(files_box, textvariable=self.pdf_in)
+        self.in_entry.grid(row=0, column=1, sticky="ew", **pad)
         ttk.Button(files_box, text="Abrir…", command=self._choose_pdf).grid(
             row=0, column=2, **pad
         )
 
         ttk.Label(files_box, text="PDF assinado").grid(row=1, column=0, sticky="w", **pad)
-        ttk.Entry(files_box, textvariable=self.pdf_out).grid(
-            row=1, column=1, sticky="ew", **pad
+        self.out_entry = ttk.Entry(files_box, textvariable=self.pdf_out)
+        self.out_entry.grid(row=1, column=1, sticky="ew", **pad)
+        self.out_button = ttk.Button(
+            files_box, text="Salvar como…", command=self._choose_output
         )
-        ttk.Button(files_box, text="Salvar como…", command=self._choose_output).grid(
-            row=1, column=2, **pad
-        )
+        self.out_button.grid(row=1, column=2, **pad)
 
         cert_box = ttk.LabelFrame(outer, text="Certificado")
         cert_box.pack(fill="x", pady=(0, 10))
@@ -225,6 +238,10 @@ class AssinadorApp(tk.Tk):
             bottom, text="Assinar PDF", command=self._start_sign
         )
         self.sign_button.pack(side="right")
+        self.finder_button = ttk.Button(
+            bottom, text="Mostrar no Finder", command=self._reveal, state="disabled"
+        )
+        self.finder_button.pack(side="right", padx=(0, 8))
 
     def _toggle_cert_frames(self):
         if self.cert_type.get() == "A1":
@@ -235,16 +252,47 @@ class AssinadorApp(tk.Tk):
         shown.pack(fill="x", padx=4, pady=4)
 
     def _choose_pdf(self):
-        value = filedialog.askopenfilename(
-            title="Selecione o PDF",
+        values = filedialog.askopenfilenames(
+            title="Selecione um ou mais PDFs",
             filetypes=[("PDF", "*.pdf"), ("Todos os arquivos", "*.*")]
         )
-        if value:
-            self.pdf_in.set(value)
-            p = Path(value)
-            self.pdf_out.set(str(p.with_name(p.stem + "-assinado.pdf")))
+        if values:
+            self._set_inputs(values)
+
+    def _set_inputs(self, paths):
+        """Um PDF: campos editáveis, como sempre. Vários: modo lote."""
+        paths = [str(p) for p in paths if str(p)]
+        if not paths:
+            return
+        self._confirmed_out = ""
+        if len(paths) == 1:
+            self.batch_files = []
+            self.in_entry.configure(state="normal")
+            self.out_entry.configure(state="normal")
+            self.out_button.configure(text="Salvar como…")
+            self.sign_button.configure(text="Assinar PDF")
+            self.pdf_in.set(paths[0])
+            self.pdf_out.set(str(output_for(paths[0])))
+            return
+        self.batch_files = paths
+        self.batch_folder = ""
+        names = ", ".join(Path(p).name for p in paths[:3])
+        if len(paths) > 3:
+            names += ", …"
+        self.pdf_in.set(f"{len(paths)} PDFs: {names}")
+        self.pdf_out.set(BATCH_OUTPUT_HINT)
+        self.in_entry.configure(state="readonly")
+        self.out_entry.configure(state="readonly")
+        self.out_button.configure(text="Pasta…")
+        self.sign_button.configure(text=f"Assinar {len(paths)} PDFs")
 
     def _choose_output(self):
+        if self.batch_files:
+            value = filedialog.askdirectory(title="Pasta para os PDFs assinados")
+            if value:
+                self.batch_folder = value
+                self.pdf_out.set(value)
+            return
         value = filedialog.asksaveasfilename(
             title="Salvar PDF assinado",
             defaultextension=".pdf",
@@ -252,6 +300,7 @@ class AssinadorApp(tk.Tk):
         )
         if value:
             self.pdf_out.set(value)
+            self._confirmed_out = str(Path(value).expanduser().resolve())
 
     def _choose_a1(self):
         value = filedialog.askopenfilename(
@@ -275,9 +324,53 @@ class AssinadorApp(tk.Tk):
         if value:
             self.a3_module.set(value)
 
+    def _plan(self) -> list[tuple[Path, Path]]:
+        """Pares (original, assinado) a assinar; levanta SigningError se houver problema."""
+        if self.batch_files:
+            return plan_batch(self.batch_files, self.batch_folder or None)
+        src, dst = self.pdf_in.get().strip(), self.pdf_out.get().strip()
+        if not src or not dst:
+            raise SigningError("Selecione o PDF de entrada e o arquivo de saída.")
+        src_path = Path(src).expanduser().resolve()
+        dst_path = Path(dst).expanduser().resolve()
+        if same_file(src_path, dst_path):
+            raise SigningError("Escolha um arquivo de saída diferente do PDF original.")
+        return [(src_path, dst_path)]
+
+    def _confirm_overwrite(self, existing: list[Path]) -> bool:
+        if len(existing) == 1:
+            message = (
+                f"Já existe um arquivo com este nome:\n\n{existing[0]}\n\n"
+                "Substituir pelo novo PDF assinado?"
+            )
+        else:
+            names = "\n".join(f"• {p.name}" for p in existing[:8])
+            if len(existing) > 8:
+                names += f"\n• … e mais {len(existing) - 8}"
+            message = (
+                f"Já existem {len(existing)} arquivos com estes nomes:\n\n{names}\n\n"
+                "Substituir pelos novos PDFs assinados?"
+            )
+        return messagebox.askyesno(
+            APP_TITLE, message, icon=messagebox.WARNING, default=messagebox.NO
+        )
+
+    def _clear_secrets(self):
+        # Depois de cada assinatura, quem chegar ao Mac não assina sem digitar de novo.
+        self.a1_password.set("")
+        self.a3_pin.set("")
+
     def _start_sign(self):
-        if not self.pdf_in.get().strip() or not self.pdf_out.get().strip():
-            messagebox.showerror(APP_TITLE, "Selecione o PDF de entrada e o arquivo de saída.")
+        try:
+            pairs = self._plan()
+        except SigningError as exc:
+            messagebox.showerror(APP_TITLE, str(exc))
+            return
+
+        existing = [
+            dst for _, dst in pairs if dst.exists() and str(dst) != self._confirmed_out
+        ]
+        if existing and not self._confirm_overwrite(existing):
             return
 
         self.sign_button.configure(state="disabled")
@@ -293,8 +386,7 @@ class AssinadorApp(tk.Tk):
         )
         job = {
             "type": self.cert_type.get(),
-            "pdf_in": self.pdf_in.get(),
-            "pdf_out": self.pdf_out.get(),
+            "pairs": pairs,
             "a1_file": self.a1_file.get(),
             "a1_password": self.a1_password.get(),
             "a3_module": self.a3_module.get(),
@@ -303,49 +395,97 @@ class AssinadorApp(tk.Tk):
             "a3_key_label": self.a3_key_label.get(),
             "a3_pin": self.a3_pin.get(),
         }
+        self._clear_secrets()
         thread = threading.Thread(target=self._sign_worker, args=(job, opts), daemon=True)
         thread.start()
 
     def _sign_worker(self, job: dict, opts: SignatureOptions):
+        def progress(index: int, total: int, src: Path):
+            if total > 1:
+                text = f"Assinando {index} de {total}: {src.name}…"
+                self.after(0, lambda: self.status.set(text))
+
         try:
             if job["type"] == "A1":
-                result = sign_pdf_a1(
-                    job["pdf_in"],
-                    job["pdf_out"],
-                    job["a1_file"],
-                    job["a1_password"],
-                    opts,
-                )
+                signer = load_a1(job["a1_file"], job["a1_password"])
+                outcomes = sign_batch(signer, job["pairs"], opts, progress)
             else:
-                result = sign_pdf_a3(
-                    job["pdf_in"],
-                    job["pdf_out"],
+                # O token é aberto uma vez só, mesmo num lote: o PIN vale para todos.
+                with open_a3(
                     job["a3_module"],
                     job["a3_token_label"],
                     job["a3_cert_label"],
                     job["a3_key_label"],
                     job["a3_pin"],
-                    opts,
-                )
+                ) as signer:
+                    outcomes = sign_batch(signer, job["pairs"], opts, progress)
 
-            self.after(0, lambda: self._success(result))
-        except SigningError as exc:
-            self.after(0, lambda e=str(exc): self._error(e))
+            self.after(0, lambda: self._finished(outcomes))
         except Exception as exc:
             self.after(0, lambda e=str(exc): self._error(e))
 
-    def _success(self, result: SigningResult):
+    @staticmethod
+    def _error_list(failed: list[BatchOutcome]) -> str:
+        return "\n".join(f"• {o.src.name}: {o.error}" for o in failed)
+
+    @staticmethod
+    def _notes(done: list[BatchOutcome], batch: bool) -> list[str]:
+        by_note: dict[str, list[str]] = {}
+        for outcome in done:
+            for note in outcome.result.notes:
+                by_note.setdefault(note, []).append(outcome.src.name)
+        lines = []
+        for note, names in by_note.items():
+            if batch and len(names) < len(done):
+                note += " (" + ", ".join(names) + ")"
+            lines.append(note)
+        return lines
+
+    def _finished(self, outcomes: list[BatchOutcome]):
         self.sign_button.configure(state="normal")
-        self.status.set("Assinatura concluída.")
-        message = f"PDF assinado com sucesso:\n\n{result.path}"
-        if result.notes:
-            message += "\n\nAtenção:\n" + "\n".join(result.notes)
-        messagebox.showinfo(APP_TITLE, message)
+        done = [o for o in outcomes if o.result is not None]
+        failed = [o for o in outcomes if o.error is not None]
+        self.last_outputs = [o.result.path for o in done]
+        self.finder_button.configure(state="normal" if done else "disabled")
+
+        if not done:
+            if len(failed) == 1:
+                self._error(failed[0].error)
+            else:
+                self._error("Nenhum PDF foi assinado:\n\n" + self._error_list(failed))
+            return
+
+        batch = len(outcomes) > 1
+        if batch:
+            summary = f"{len(done)} de {len(outcomes)} PDFs assinados."
+            self.status.set(summary)
+            message = summary
+            if failed:
+                message += "\n\nNão assinados:\n" + self._error_list(failed)
+        else:
+            self.status.set("Assinatura concluída.")
+            message = f"PDF assinado com sucesso:\n\n{done[0].result.path}"
+
+        notes = self._notes(done, batch)
+        if notes:
+            message += "\n\nAtenção:\n" + "\n".join(notes)
+        if failed:
+            messagebox.showwarning(APP_TITLE, message)
+        else:
+            messagebox.showinfo(APP_TITLE, message)
 
     def _error(self, message: str):
         self.sign_button.configure(state="normal")
         self.status.set("Falha na assinatura.")
         messagebox.showerror(APP_TITLE, message)
+
+    def _reveal(self):
+        existing = [p for p in self.last_outputs if p.exists()]
+        if not existing:
+            messagebox.showinfo(APP_TITLE, "O PDF assinado não está mais no mesmo lugar.")
+            return
+        # "open -R" abre a pasta no Finder com o arquivo selecionado.
+        subprocess.Popen(["open", "-R", str(existing[0])])
 
 
 def main():
